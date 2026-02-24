@@ -1,6 +1,6 @@
 import os
 import requests
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from supabase import create_client
 from dotenv import load_dotenv
 
@@ -12,6 +12,9 @@ load_dotenv()
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+
+if not SUPABASE_URL or not SUPABASE_KEY:
+    raise ValueError("Supabase credentials missing.")
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
@@ -36,12 +39,14 @@ def send_telegram_alert(message):
     }
 
     try:
-        requests.post(url, json=payload, timeout=10)
+        response = requests.post(url, json=payload, timeout=10)
+        if response.status_code != 200:
+            print("Telegram failed:", response.text)
     except Exception as e:
         print("Telegram error:", e)
 
 # ==============================
-# Severity Dictionaries
+# Keyword Scoring Dictionaries
 # ==============================
 
 HIGH_IMPACT = {
@@ -82,7 +87,9 @@ LOW_IMPACT = {
 # ==============================
 
 def fetch_recent_events():
-    twelve_hours_ago = (datetime.utcnow() - timedelta(hours=12)).isoformat()
+    twelve_hours_ago = (
+        datetime.now(timezone.utc) - timedelta(hours=12)
+    ).isoformat()
 
     result = (
         supabase.table("processed_events")
@@ -91,10 +98,10 @@ def fetch_recent_events():
         .execute()
     )
 
-    return result.data
+    return result.data or []
 
 # ==============================
-# Fetch Raw News Text
+# Fetch Article Text
 # ==============================
 
 def fetch_article_text(raw_news_id):
@@ -106,33 +113,36 @@ def fetch_article_text(raw_news_id):
         .execute()
     )
 
-    data = result.data
+    data = result.data or {}
     return f"{data.get('title','')} {data.get('content','')}".lower()
 
 # ==============================
-# Classify Event Severity
+# Classify Event
 # ==============================
 
 def classify_event(text):
     score = 0
-    severity = None
 
     for keyword, weight in HIGH_IMPACT.items():
         if keyword in text:
             score += weight
-            severity = "HIGH"
 
-    if not severity:
-        for keyword, weight in MEDIUM_IMPACT.items():
-            if keyword in text:
-                score += weight
-                severity = "MEDIUM"
+    for keyword, weight in MEDIUM_IMPACT.items():
+        if keyword in text:
+            score += weight
 
-    if not severity:
-        for keyword, weight in LOW_IMPACT.items():
-            if keyword in text:
-                score += weight
-                severity = "LOW"
+    for keyword, weight in LOW_IMPACT.items():
+        if keyword in text:
+            score += weight
+
+    if score >= 40:
+        severity = "HIGH"
+    elif abs(score) >= 20:
+        severity = "MEDIUM"
+    elif abs(score) > 0:
+        severity = "LOW"
+    else:
+        severity = None
 
     return severity, score
 
@@ -147,10 +157,10 @@ def signal_exists(raw_news_id):
         .eq("raw_news_id", raw_news_id)
         .execute()
     )
-    return len(result.data) > 0
+    return bool(result.data)
 
 # ==============================
-# Generate Intraday Signals
+# Generate Signals
 # ==============================
 
 def generate_intraday_signals():
@@ -169,47 +179,34 @@ def generate_intraday_signals():
         text = fetch_article_text(raw_news_id)
         severity, score = classify_event(text)
 
+        print(f"DEBUG → Score: {score}, Severity: {severity}")
+
         if not severity:
             continue
 
-        if score >= 10:
+        if score >= 40:
             signal_type = "BUY"
-        elif score <= -10:
+        elif score <= -40:
             signal_type = "SELL"
         else:
             continue
 
-        # Insert Signal
+        # Insert signal
         supabase.table("signals").insert({
             "company_id": company_id,
             "raw_news_id": raw_news_id,
             "signal_type": signal_type,
             "severity": severity,
             "signal_score": score,
-            "generated_at": datetime.utcnow().isoformat(),
+            "generated_at": datetime.now(timezone.utc).isoformat(),
             "is_active": True
         }).execute()
 
-        # Fetch company name
-        company = (
-            supabase.table("companies")
-            .select("name")
-            .eq("id", company_id)
-            .single()
-            .execute()
-        )
+        # Fetch metadata
+        company = supabase.table("companies").select("name").eq("id", company_id).single().execute()
+        news = supabase.table("raw_news").select("title").eq("id", raw_news_id).single().execute()
 
         company_name = company.data["name"]
-
-        # Fetch headline
-        news = (
-            supabase.table("raw_news")
-            .select("title")
-            .eq("id", raw_news_id)
-            .single()
-            .execute()
-        )
-
         headline = news.data["title"]
 
         message = f"""
@@ -220,33 +217,14 @@ Score: *{score}*
 
 📰 {headline}
 """
-def send_telegram_alert(message):
-    token = os.getenv("8640786170:AAGTaiZSACLjBM0giXrwy1WS8HN97ge0HIc")
-    chat_id = os.getenv("450110004")
 
-    if not token or not chat_id:
-        print("Telegram credentials missing.")
-        return
+        send_telegram_alert(message)
 
-    url = f"https://api.telegram.org/bot8640786170:AAGTaiZSACLjBM0giXrwy1WS8HN97ge0HIc/sendMessage"
+        print(f"{signal_type} signal sent for {company_name}")
 
-    payload = {
-        "chat_id": chat_id,
-        "text": message,
-        "parse_mode": "Markdown"
-    }
-
-    for attempt in range(3):  # retry 3 times
-        try:
-            response = requests.post(url, json=payload, timeout=10)
-            if response.status_code == 200:
-                return
-        except Exception as e:
-            print(f"Telegram attempt {attempt+1} failed:", e)
+    print("Intraday engine completed.")
 
 # ==============================
-
-import time
 
 if __name__ == "__main__":
     generate_intraday_signals()
