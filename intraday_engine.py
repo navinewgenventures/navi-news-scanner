@@ -172,9 +172,9 @@ def generate_intraday_signals():
         if not severity:
             continue
 
-        if score >= 40:
+        if score >= 10:
             signal_type = "BUY"
-        elif score <= -40:
+        elif score <= -10:
             signal_type = "SELL"
         else:
             continue
